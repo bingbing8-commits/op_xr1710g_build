@@ -69,6 +69,7 @@ jobs:
       openwrt_ref: ${{ steps.resolve.outputs.openwrt_ref }}
       target_profile: ${{ steps.resolve.outputs.target_profile }}
       package_shards: ${{ steps.resolve.outputs.package_shards }}
+      package_matrix: ${{ steps.resolve.outputs.package_matrix }}
       extra_config: ${{ steps.resolve.outputs.extra_config }}
       create_release: ${{ steps.resolve.outputs.create_release }}
       source_commit: ${{ steps.source.outputs.source_commit }}
@@ -111,11 +112,20 @@ jobs:
             *) package_shards=12 ;;
           esac
 
+          case "${package_shards}" in
+            4) package_matrix='[0,1,2,3]' ;;
+            6) package_matrix='[0,1,2,3,4,5]' ;;
+            8) package_matrix='[0,1,2,3,4,5,6,7]' ;;
+            10) package_matrix='[0,1,2,3,4,5,6,7,8,9]' ;;
+            12) package_matrix='[0,1,2,3,4,5,6,7,8,9,10,11]' ;;
+          esac
+
           {
             printf 'openwrt_repo=%s\n' "${openwrt_repo}"
             printf 'openwrt_ref=%s\n' "${openwrt_ref}"
             printf 'target_profile=%s\n' "${target_profile}"
             printf 'package_shards=%s\n' "${package_shards}"
+            printf 'package_matrix=%s\n' "${package_matrix}"
             printf 'create_release=%s\n' "${create_release}"
             printf 'extra_config<<__EXTRA_CONFIG__\n%s\n__EXTRA_CONFIG__\n' "${extra_config}"
           } >> "$GITHUB_OUTPUT"
@@ -189,7 +199,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: ${{ fromJSON(needs.check-upstream.outputs.package_matrix) }}
     env:
       OPENWRT_REPO: ${{ needs.check-upstream.outputs.openwrt_repo }}
       OPENWRT_REF: ${{ needs.check-upstream.outputs.openwrt_ref }}
@@ -747,20 +757,30 @@ jobs:
           make -j"$(nproc)" tools/install toolchain/install || make -j1 V=s tools/install toolchain/install
 
       - name: Compile package kernel prerequisites
-        if: ${{ matrix.shard == 0 }}
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
-          set -o pipefail
+          set -euo pipefail
           nproc
-          if ! timeout 120m make -j1 V=s target/linux/compile; then
-            echo "::warning::target/linux/compile did not finish cleanly; package shard build will continue and record package-level failures."
-          fi
+          timeout 150m make -j1 V=s target/linux/compile
 
-      - name: Compile required packages
-        if: ${{ matrix.shard == 0 }}
+          kernel_config="$(find build_dir -path '*/linux-*/.config' -type f -print -quit)"
+          modules_builtin="$(find build_dir -path '*/linux-*/modules.builtin' -type f -print -quit)"
+          test -n "${kernel_config}"
+          test -n "${modules_builtin}"
+
+          cd "${GITHUB_WORKSPACE}"
+          {
+            find "${SOURCE_DIR}/bin/packages" -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null || true
+            find "${SOURCE_DIR}/bin/targets/${TARGET}/${SUBTARGET}/packages" -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null || true
+          } | sort -u > "kernel-prerequisite-files-${SHARD_INDEX}.txt"
+
+      - name: Resolve required package directories
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
-          set -eu
+          set -euo pipefail
+          required_list="${GITHUB_WORKSPACE}/required-package-dirs.txt"
+          : > "${required_list}"
+
           for pkg in luci-app-openclash luci-app-mlo luci-app-airoha-npu luci-app-w1700k-fancontrol sing-box luci-proto-wireguard; do
             pkgdir=""
             for candidate in \
@@ -789,34 +809,85 @@ jobs:
               echo "Required package Makefile was not found: ${pkg}"
               exit 1
             fi
+            printf '%s\n' "${pkgdir}" >> "${required_list}"
+          done
 
+          sort -u -o "${required_list}" "${required_list}"
+          cat "${required_list}"
+
+      - name: Compile required packages
+        if: ${{ matrix.shard == 0 }}
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r pkgdir; do
+            [ -n "${pkgdir}" ] || continue
             echo "::group::required ${pkgdir}"
-            make -j"$(nproc)" "${pkgdir}/compile" IGNORE_ERRORS=m || make -j1 V=s "${pkgdir}/compile" IGNORE_ERRORS=m
+            make -j"$(nproc)" "${pkgdir}/compile" || make -j1 V=s "${pkgdir}/compile"
             echo "::endgroup::"
+          done < "${GITHUB_WORKSPACE}/required-package-dirs.txt"
+
+          for pkg in luci-app-openclash luci-app-mlo luci-app-airoha-npu luci-app-w1700k-fancontrol sing-box luci-proto-wireguard; do
+            artifact="$(
+              find bin -type f \( -name "${pkg}_*.ipk" -o -name "${pkg}_*.apk" \) \
+                -print -quit
+            )"
+            if [ -z "${artifact}" ]; then
+              echo "Required package artifact was not produced: ${pkg}"
+              exit 1
+            fi
+            echo "Required package artifact: ${artifact}"
           done
 
       - name: Compile assigned packages
+        id: compile-packages
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
-          set -u
+          set -euo pipefail
+          selected_list="${GITHUB_WORKSPACE}/selected-package-sources.txt"
           package_list="${GITHUB_WORKSPACE}/package-list-${SHARD_INDEX}.txt"
           failed_list="${GITHUB_WORKSPACE}/failed-packages-${SHARD_INDEX}.txt"
           : > "${failed_list}"
 
-          find package -name Makefile -type f -print0 \
-            | xargs -0 grep -El '^(define Package/|define KernelPackage/|LUCI_TITLE:=|LUCI_PKGNAME:=)' \
-            | sed 's#/Makefile$##' \
-            | sort \
-            | awk -v shard="${SHARD_INDEX}" -v count="${PACKAGE_SHARDS}" '((NR - 1) % count) == shard { print }' \
+          test -s tmp/.packageinfo
+          awk -f "${GITHUB_WORKSPACE}/scripts/select-package-sources.awk" \
+            .config tmp/.packageinfo \
+            | sort -u \
+            > "${selected_list}"
+          test -s "${selected_list}"
+
+          while IFS= read -r required_dir; do
+            [ -n "${required_dir}" ] || continue
+            if ! grep -Fxq "${required_dir}" "${selected_list}"; then
+              echo "Required package source was not selected by metadata: ${required_dir}"
+              exit 1
+            fi
+          done < "${GITHUB_WORKSPACE}/required-package-dirs.txt"
+
+          grep -Fvx -f "${GITHUB_WORKSPACE}/required-package-dirs.txt" \
+            "${selected_list}" > "${selected_list}.without-required" || true
+          mv "${selected_list}.without-required" "${selected_list}"
+
+          while IFS= read -r pkgdir; do
+            if [ ! -f "${pkgdir}/Makefile" ]; then
+              echo "Selected package source has no Makefile: ${pkgdir}"
+              exit 1
+            fi
+          done < "${selected_list}"
+
+          awk -v shard="${SHARD_INDEX}" -v count="${PACKAGE_SHARDS}" \
+            '((NR - 1) % count) == shard { print }' \
+            "${selected_list}" \
             > "${package_list}"
 
-          echo "Shard ${SHARD_INDEX}/${PACKAGE_SHARDS} package count: $(wc -l < "${package_list}")"
+          echo "Selected non-required source count: $(wc -l < "${selected_list}")"
+          echo "Shard ${SHARD_INDEX}/${PACKAGE_SHARDS} source count: $(wc -l < "${package_list}")"
           while IFS= read -r pkgdir; do
             [ -n "${pkgdir}" ] || continue
             echo "::group::${pkgdir}"
-            if make -j"$(nproc)" "${pkgdir}/compile" IGNORE_ERRORS=m; then
+            if make -j"$(nproc)" "${pkgdir}/compile"; then
               echo "OK ${pkgdir}"
-            elif make -j1 V=s "${pkgdir}/compile" IGNORE_ERRORS=m; then
+            elif make -j1 V=s "${pkgdir}/compile"; then
               echo "OK ${pkgdir} after serial retry"
             else
               echo "FAILED ${pkgdir}"
@@ -825,28 +896,41 @@ jobs:
             echo "::endgroup::"
           done < "${package_list}"
 
-          echo "Failed package count: $(wc -l < "${failed_list}")"
+          failed_count="$(wc -l < "${failed_list}")"
+          echo "Failed selected source count: ${failed_count}"
+          echo "failed_count=${failed_count}" >> "$GITHUB_OUTPUT"
 
       - name: Collect package shard artifacts
         id: collect
         run: |
-          set -eux
+          set -euo pipefail
           outdir="artifacts/packages/shard-${SHARD_INDEX}"
           mkdir -p "${outdir}"
 
-          package_files="${outdir}/package-files.txt"
+          all_package_files="${GITHUB_WORKSPACE}/all-package-files-${SHARD_INDEX}.txt"
+          package_files="${outdir}/package-files-shard-${SHARD_INDEX}.txt"
           {
             find "${SOURCE_DIR}/bin/packages" -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null || true
             find "${SOURCE_DIR}/bin/targets/${TARGET}/${SUBTARGET}/packages" -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null || true
-          } | sort -u > "${package_files}"
+          } | sort -u > "${all_package_files}"
+
+          if [ "${SHARD_INDEX}" = "0" ]; then
+            cp "${all_package_files}" "${package_files}"
+          else
+            comm -23 \
+              "${all_package_files}" \
+              "kernel-prerequisite-files-${SHARD_INDEX}.txt" \
+              > "${package_files}"
+          fi
 
           if [ -s "${package_files}" ]; then
             tar -I 'zstd -T0 -19' -cf "${outdir}/openwrt-xr1710g-packages-shard-${SHARD_INDEX}-${OPENWRT_SOURCE_SHORT}.tar.zst" -T "${package_files}"
           else
-            echo "No package files were produced by shard ${SHARD_INDEX}." > "${outdir}/NO_PACKAGES.txt"
+            echo "No non-prerequisite package files were produced by shard ${SHARD_INDEX}." > "${outdir}/NO_PACKAGES-shard-${SHARD_INDEX}.txt"
           fi
 
-          cp "failed-packages-${SHARD_INDEX}.txt" "${outdir}/FAILED_PACKAGES.txt"
+          cp "failed-packages-${SHARD_INDEX}.txt" "${outdir}/FAILED_PACKAGES-shard-${SHARD_INDEX}.txt"
+          cp "package-list-${SHARD_INDEX}.txt" "${outdir}/PACKAGE_SOURCES-shard-${SHARD_INDEX}.txt"
           cp -a "${SOURCE_DIR}/.config" "${outdir}/openwrt-xr1710g-packages-shard-${SHARD_INDEX}.config"
           {
             echo "OpenWrt repo: ${OPENWRT_REPO}"
@@ -858,7 +942,8 @@ jobs:
             echo "Build time: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %z')"
           } > "${outdir}/BUILDINFO-packages-shard-${SHARD_INDEX}.txt"
 
-          (cd "${outdir}" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          checksum_file="SHA256SUMS-packages-shard-${SHARD_INDEX}"
+          (cd "${outdir}" && find . -maxdepth 1 -type f ! -name "${checksum_file}" -print0 | sort -z | xargs -0 sha256sum > "${checksum_file}")
           echo "artifact_dir=${outdir}" >> "$GITHUB_OUTPUT"
 
       - name: Upload package shard artifact
@@ -868,6 +953,22 @@ jobs:
           path: ${{ steps.collect.outputs.artifact_dir }}
           if-no-files-found: error
           retention-days: 14
+
+      - name: Fail shard when selected packages failed
+        if: ${{ always() }}
+        run: |
+          set -eu
+          failed_list="failed-packages-${SHARD_INDEX}.txt"
+          if [ ! -f "${failed_list}" ]; then
+            echo "Package failure report was not created for shard ${SHARD_INDEX}."
+            exit 1
+          fi
+          if [ -s "${failed_list}" ]; then
+            echo "Selected package sources failed in shard ${SHARD_INDEX}:"
+            cat "${failed_list}"
+            exit 1
+          fi
+          echo "All selected package sources in shard ${SHARD_INDEX} compiled successfully."
 
   publish-packages:
     name: Publish package shards
@@ -884,13 +985,73 @@ jobs:
           path: release-packages
           merge-multiple: true
 
+      - name: Validate and summarize package shards
+        env:
+          PACKAGE_SHARDS: ${{ needs.check-upstream.outputs.package_shards }}
+          OPENWRT_SOURCE_SHORT: ${{ needs.check-upstream.outputs.source_short }}
+        run: |
+          set -euo pipefail
+          aggregate_failures="release-packages/FAILED_PACKAGES.txt"
+          aggregate_files="release-packages/package-files.txt"
+          : > "${aggregate_failures}"
+          : > "${aggregate_files}"
+
+          for ((shard = 0; shard < PACKAGE_SHARDS; shard++)); do
+            failed="release-packages/FAILED_PACKAGES-shard-${shard}.txt"
+            sources="release-packages/PACKAGE_SOURCES-shard-${shard}.txt"
+            package_files="release-packages/package-files-shard-${shard}.txt"
+            config="release-packages/openwrt-xr1710g-packages-shard-${shard}.config"
+            buildinfo="release-packages/BUILDINFO-packages-shard-${shard}.txt"
+            checksums="release-packages/SHA256SUMS-packages-shard-${shard}"
+
+            for required_file in "${failed}" "${sources}" "${package_files}" "${config}" "${buildinfo}" "${checksums}"; do
+              if [ ! -f "${required_file}" ]; then
+                echo "Missing package shard report: ${required_file}"
+                exit 1
+              fi
+            done
+
+            if [ -s "${failed}" ]; then
+              sed "s#^#shard ${shard}: #" "${failed}" >> "${aggregate_failures}"
+            fi
+            cat "${package_files}" >> "${aggregate_files}"
+
+            archive="release-packages/openwrt-xr1710g-packages-shard-${shard}-${OPENWRT_SOURCE_SHORT}.tar.zst"
+            no_packages="release-packages/NO_PACKAGES-shard-${shard}.txt"
+            if [ ! -f "${archive}" ] && [ ! -f "${no_packages}" ]; then
+              echo "Shard ${shard} has neither a package archive nor a no-packages report."
+              exit 1
+            fi
+          done
+
+          sort -u -o "${aggregate_files}" "${aggregate_files}"
+          if [ -s "${aggregate_failures}" ]; then
+            echo "Package shards reported selected source failures:"
+            cat "${aggregate_failures}"
+            exit 1
+          fi
+
+          {
+            echo "All ${PACKAGE_SHARDS} package shards completed successfully."
+            echo "Failed selected package sources: 0"
+            echo "Unique package files: $(wc -l < "${aggregate_files}")"
+          } > release-packages/PACKAGE_BUILD_STATUS.txt
+
+          (
+            cd release-packages
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
         run: |
-          set -eux
+          set -euo pipefail
           build_time="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %z')"
           find release-packages -type f -printf '%p\n' 2>/dev/null | sort > release-assets.txt
 
@@ -902,12 +1063,12 @@ jobs:
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" \
               --title "packages ${build_time}" \
-              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}"
+              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}. All selected package sources compiled successfully."
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
           else
             gh release create "${RELEASE_TAG}" "${assets[@]}" \
               --title "packages ${build_time}" \
-              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}"
+              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}. All selected package sources compiled successfully."
           fi
 
       - name: Clean package release staging files

@@ -14,6 +14,7 @@ on:
       - .github/workflows/build-packages-xr1710g.yml
       - .github/workflows/build-toolchain-xr1710g.yml
       - patches/**
+      - scripts/**
       - README.md
   workflow_dispatch:
     inputs:

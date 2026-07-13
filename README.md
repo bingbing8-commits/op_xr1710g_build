@@ -24,7 +24,7 @@ A source watcher workflow checks the ImmortalWrt `openwrt-24.10` branch once per
 
 A separate toolchain workflow runs once per week, on repository dispatch, and after build workflow changes. It deletes matching old Actions cache keys at the start of the next toolchain run, then builds the OpenWrt host tools and target toolchain, saves the fresh toolchain into Actions cache, and uploads a profile-specific `openwrt-xr1710g-toolchain-*.tar.zst` archive to a GitHub Release. Automatic firmware and package builds run only after a successful toolchain build and first try to restore the matching toolchain from cache, then from the matching toolchain release. Manual firmware/package runs still attempt a normal OpenWrt build when no prebuilt toolchain is available.
 
-Packages are built by a separate matrix workflow. It splits real OpenWrt package Makefiles across shards so one GitHub-hosted runner job does not have to compile every package before the six-hour job limit.
+Packages are built by a separate matrix workflow. It uses the final OpenWrt `.config` and `tmp/.packageinfo` metadata to split only source packages selected for the Airoha target across shards, so unrelated platform packages are not treated as XR1710G failures. Every shard builds the target kernel prerequisites before compiling its assigned sources.
 
 Firmware, toolchain, and package shard releases all include the OpenWrt `.config` used for that build.
 
@@ -35,6 +35,7 @@ The expected system firmware artifact is the `*-sysupgrade.itb` file. For XR1710
 - Do the OpenWrt source checkout and build on the Ubuntu runner. Avoid cloning the full OpenWrt tree on macOS case-insensitive filesystems.
 - The main build tree defaults to ImmortalWrt. If that tree does not contain `gemtek_xr1710g-ubi`, the workflow imports the Gemtek XR1710G device profile, DTS, common image definitions, and board files from the `xr1710g` branch of `hurrian/openwrt-w1700k`.
 - The packages workflow enables OpenWrt buildbot-style package output with `CONFIG_ALL`, `CONFIG_ALL_KMODS`, and `CONFIG_ALL_NONSHARED`.
+- Package shard errors are not ignored. Each shard uploads a uniquely named source list, package-file list, failure report, config, and checksum file before failing. A package Release is published only when every selected source package compiles successfully and every shard report passes validation.
 - OpenClash is added from <https://github.com/vernesong/OpenClash> and selected into the firmware as `luci-app-openclash`.
 - The default config requires `luci-app-openclash`, `luci-app-mlo`, `luci-app-airoha-npu`, `luci-app-w1700k-fancontrol`, `sing-box`, and `luci-proto-wireguard`.
 - MLO LuCI is added from <https://github.com/YYH2913/luci-app-mlo>.
