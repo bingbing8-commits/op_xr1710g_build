@@ -33,16 +33,18 @@ The expected system firmware artifact is the `*-sysupgrade.itb` file. For XR1710
 ## Notes
 
 - Do the OpenWrt source checkout and build on the Ubuntu runner. Avoid cloning the full OpenWrt tree on macOS case-insensitive filesystems.
-- The main build tree defaults to ImmortalWrt. If that tree does not contain `gemtek_xr1710g-ubi`, the workflow imports the Gemtek XR1710G device profile, DTS, common image definitions, and board files from the OpenWrt XR1710G PR head.
+- The main build tree defaults to ImmortalWrt. If that tree does not contain `gemtek_xr1710g-ubi`, the workflow imports the Gemtek XR1710G device profile, DTS, common image definitions, and board files from the `xr1710g` branch of `hurrian/openwrt-w1700k`.
 - The packages workflow enables OpenWrt buildbot-style package output with `CONFIG_ALL`, `CONFIG_ALL_KMODS`, and `CONFIG_ALL_NONSHARED`.
 - OpenClash is added from <https://github.com/vernesong/OpenClash> and selected into the firmware as `luci-app-openclash`.
-- The default config requires `luci-app-openclash`, `luci-app-mlo`, `luci-app-airoha-npu`, `luci-app-w1700k-fancontrol`, `luci-app-sing-box`, and `luci-proto-wireguard`.
+- The default config requires `luci-app-openclash`, `luci-app-mlo`, `luci-app-airoha-npu`, `luci-app-w1700k-fancontrol`, `sing-box`, and `luci-proto-wireguard`.
 - MLO LuCI is added from <https://github.com/YYH2913/luci-app-mlo>.
+- The hostapd existing-interface fix is backported from <https://github.com/YYH2913/openwrt> to avoid a misleading `ENFILE` error when ucode has already created an AP interface.
 - Airoha NPU LuCI is added from <https://github.com/rchen14b/luci-app-airoha-npu>.
 - W1700K fan control is added from <https://github.com/rchen14b/luci-app-w1700k-fancontrol>.
 - Firmware release titles use `路由器固件 <build time>`. Toolchain release titles use `toolchain <build time>`.
 - After uploading Release assets, workflows clean local release staging directories. Toolchain cache files are retained until the next toolchain workflow run begins.
 - `actions/cache` cache misses and Node runtime deprecation messages are runner warnings, not build failures.
+- Download caches use an explicit versioned namespace. Small failed downloads are removed only from the top level of `dl`, so valid files under `dl/go-mod-cache` are preserved.
 - OpenWrt dependency warnings from package Makefiles are expected when all packages are scanned. The actual failure signal is a later `ERROR` or failed workflow step.
 - The workflow adds a first-boot wireless defaults script that sets a valid country code, defaulting to `CN`.
 - The 5 GHz radio is optionally pinned to channel `36` on first boot to avoid DFS startup delays and client discovery issues.
@@ -54,4 +56,5 @@ The expected system firmware artifact is the `*-sysupgrade.itb` file. For XR1710
 - Gemtek XR1710G OpenWrt PR overlay: <https://github.com/openwrt/openwrt/pull/22397>
 - W1700K UBI build workflow reference: <https://github.com/OpenWRT-fanboy/w1700k-ubi-build>
 - XR1710G U-Boot and HTTP Recovery notes: <https://github.com/YYH2913/http-uboot-xr1710g>
+- YYH2913 OpenWrt XR1710G reference branch: <https://github.com/YYH2913/openwrt/tree/xr1710g>
 - OpenWrt XR1710G PR: <https://github.com/openwrt/openwrt/pull/22397>

@@ -45,6 +45,7 @@ env:
   SOURCE_DIR: openwrt
   TARGET: airoha
   SUBTARGET: an7581
+  DOWNLOAD_CACHE_VERSION: v2
 
 jobs:
   skip-unsuccessful-toolchain:
@@ -558,11 +559,11 @@ jobs:
           path: |
             ${{ env.SOURCE_DIR }}/dl
             ${{ env.CCACHE_DIR }}
-          key: xr1710g-packages-${{ runner.os }}-${{ env.SAFE_REF }}-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-${{ hashFiles('.github/workflows/build-packages-xr1710g.yml') }}
+          key: xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-packages-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-${{ hashFiles('.github/workflows/build-packages-xr1710g.yml') }}
           restore-keys: |
-            xr1710g-packages-${{ runner.os }}-${{ env.SAFE_REF }}-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-
-            xr1710g-${{ runner.os }}-${{ env.SAFE_REF }}-
-            xr1710g-${{ runner.os }}-
+            xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-packages-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-
+            xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-
+            xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-
 
       - name: Restore weekly toolchain cache
         id: toolchain-cache
@@ -627,6 +628,19 @@ jobs:
           set -eux
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      - name: Backport YYH2913 hostapd existing-interface fix
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -eux
+          hostapd_patches="package/network/services/hostapd/patches"
+          if grep -Rqs 'nl80211_use_existing_iface' "${hostapd_patches}"; then
+            echo "Hostapd existing-interface fix is already present."
+          else
+            install -m 0644 \
+              "${GITHUB_WORKSPACE}/patches/yyh2913/999-nl80211-short-circuit-use-existing-iface.patch" \
+              "${hostapd_patches}/999-nl80211-short-circuit-use-existing-iface.patch"
+          fi
 
       - name: Fix libffi generated header lookup
         working-directory: ${{ env.SOURCE_DIR }}
