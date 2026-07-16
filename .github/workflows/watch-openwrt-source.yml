@@ -17,11 +17,19 @@ on:
       openwrt_ref:
         description: OpenWrt branch, tag, or commit
         required: true
-        default: openwrt-24.10
+        default: master
+      integration_repo:
+        description: XR1710G integration source repository
+        required: true
+        default: https://github.com/YYH2913/openwrt.git
+      integration_ref:
+        description: XR1710G integration branch, tag, or commit ("none" skips the merge)
+        required: true
+        default: xr1710g-6.18-integration
       target_profile:
         description: OpenWrt device profile
         required: true
-        default: gemtek_xr1710g-ubi
+        default: econet_xr1710g-ubi
       force_build:
         description: Dispatch the build chain even when matching releases already exist
         required: true
@@ -44,15 +52,17 @@ concurrency:
 env:
   GH_REPO: ${{ github.repository }}
   OPENWRT_REPO: ${{ github.event.inputs.openwrt_repo || 'https://github.com/immortalwrt/immortalwrt.git' }}
-  OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'openwrt-24.10' }}
-  TARGET_PROFILE: ${{ github.event.inputs.target_profile || 'gemtek_xr1710g-ubi' }}
+  OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'master' }}
+  INTEGRATION_REPO: ${{ github.event.inputs.integration_repo || 'https://github.com/YYH2913/openwrt.git' }}
+  INTEGRATION_REF: ${{ github.event.inputs.integration_ref || 'xr1710g-6.18-integration' }}
+  TARGET_PROFILE: ${{ github.event.inputs.target_profile || 'econet_xr1710g-ubi' }}
   FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.force_build) || 'false' }}
   CREATE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.create_release) || 'true' }}
   TOOLCHAIN_CACHE_VERSION: v2
 
 jobs:
   watch:
-    name: Watch ${{ github.event.inputs.openwrt_ref || 'openwrt-24.10' }}
+    name: Watch ${{ github.event.inputs.openwrt_ref || 'master' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -71,14 +81,29 @@ jobs:
           safe_ref="$(printf '%s' "${OPENWRT_REF}" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//;s/-$//')"
           target_profile="${TARGET_PROFILE}"
           case "${target_profile}" in
-            gemtek_xr1710g) target_profile="gemtek_xr1710g-ubi" ;;
+            gemtek_xr1710g|gemtek_xr1710g-ubi|econet_xr1710g) target_profile="econet_xr1710g-ubi" ;;
           esac
           if [ -z "${safe_ref}" ]; then
             safe_ref="${source_short}"
           fi
 
-          firmware_tag="xr1710g-${safe_ref}-${source_short}"
-          packages_tag="xr1710g-packages-${safe_ref}-${source_short}"
+          integration_ref="${INTEGRATION_REF}"
+          case "${integration_ref}" in
+            none|skip) integration_ref="" ;;
+          esac
+          integration_commit=""
+          integration_short=""
+          if [ -n "${integration_ref}" ]; then
+            mkdir -p integration-probe
+            git -C integration-probe init
+            git -C integration-probe remote add origin "${INTEGRATION_REPO}"
+            git -C integration-probe fetch --depth 1 origin "${integration_ref}"
+            integration_commit="$(git -C integration-probe rev-parse FETCH_HEAD)"
+            integration_short="$(printf '%s' "${integration_commit}" | cut -c1-12)"
+          fi
+
+          firmware_tag="xr1710g-${safe_ref}-${source_short}${integration_short:+-${integration_short}}"
+          packages_tag="xr1710g-packages-${safe_ref}-${source_short}${integration_short:+-${integration_short}}"
           toolchain_prefix="xr1710g-toolchain-${TOOLCHAIN_CACHE_VERSION}-${safe_ref}-${source_short}-${target_profile}-"
 
           {
@@ -86,6 +111,9 @@ jobs:
             printf 'source_short=%s\n' "${source_short}"
             printf 'safe_ref=%s\n' "${safe_ref}"
             printf 'target_profile=%s\n' "${target_profile}"
+            printf 'integration_ref=%s\n' "${integration_ref}"
+            printf 'integration_commit=%s\n' "${integration_commit}"
+            printf 'integration_short=%s\n' "${integration_short}"
             printf 'firmware_tag=%s\n' "${firmware_tag}"
             printf 'packages_tag=%s\n' "${packages_tag}"
             printf 'toolchain_prefix=%s\n' "${toolchain_prefix}"
@@ -165,6 +193,9 @@ jobs:
           echo "OpenWrt repo: ${OPENWRT_REPO}"
           echo "OpenWrt ref: ${OPENWRT_REF}"
           echo "OpenWrt commit: ${{ steps.source.outputs.source_commit }}"
+          echo "Integration repo: ${INTEGRATION_REPO}"
+          echo "Integration ref: ${{ steps.source.outputs.integration_ref }}"
+          echo "Integration commit: ${{ steps.source.outputs.integration_commit }}"
           echo "Target profile: ${{ steps.source.outputs.target_profile }}"
           echo "Toolchain release exists: ${{ steps.releases.outputs.toolchain_exists }}"
           echo "Firmware release exists: ${{ steps.releases.outputs.firmware_exists }}"
@@ -183,8 +214,11 @@ jobs:
             -f event_type=openwrt-updated \
             -f client_payload[openwrt_repo]="${OPENWRT_REPO}" \
             -f client_payload[openwrt_ref]="${OPENWRT_REF}" \
+            -f client_payload[integration_repo]="${INTEGRATION_REPO}" \
+            -f client_payload[integration_ref]="${INTEGRATION_REF}" \
             -f client_payload[target_profile]="${{ steps.source.outputs.target_profile }}" \
             -f client_payload[create_release]="${CREATE_RELEASE}" \
             -f client_payload[source_commit]="${{ steps.source.outputs.source_commit }}" \
             -f client_payload[source_short]="${{ steps.source.outputs.source_short }}" \
+            -f client_payload[integration_commit]="${{ steps.source.outputs.integration_commit }}" \
             -f client_payload[reason]="${{ steps.releases.outputs.reason }}"

@@ -15,11 +15,19 @@ on:
       openwrt_ref:
         description: OpenWrt branch, tag, or commit
         required: true
-        default: openwrt-24.10
+        default: master
+      integration_repo:
+        description: XR1710G integration source repository
+        required: true
+        default: https://github.com/YYH2913/openwrt.git
+      integration_ref:
+        description: XR1710G integration branch, tag, or commit ("none" skips the merge)
+        required: true
+        default: xr1710g-6.18-integration
       target_profile:
         description: OpenWrt device profile
         required: true
-        default: gemtek_xr1710g-ubi
+        default: econet_xr1710g-ubi
       package_shards:
         description: Number of package shards to run
         required: true
@@ -67,6 +75,8 @@ jobs:
       skip_reason: ${{ steps.decision.outputs.skip_reason }}
       openwrt_repo: ${{ steps.resolve.outputs.openwrt_repo }}
       openwrt_ref: ${{ steps.resolve.outputs.openwrt_ref }}
+      integration_repo: ${{ steps.resolve.outputs.integration_repo }}
+      integration_ref: ${{ steps.resolve.outputs.integration_ref }}
       target_profile: ${{ steps.resolve.outputs.target_profile }}
       package_shards: ${{ steps.resolve.outputs.package_shards }}
       package_matrix: ${{ steps.resolve.outputs.package_matrix }}
@@ -75,7 +85,9 @@ jobs:
       source_commit: ${{ steps.source.outputs.source_commit }}
       source_short: ${{ steps.source.outputs.source_short }}
       safe_ref: ${{ steps.source.outputs.safe_ref }}
-      release_tag: ${{ steps.source.outputs.release_tag }}
+      integration_commit: ${{ steps.integration.outputs.integration_commit }}
+      integration_short: ${{ steps.integration.outputs.integration_short }}
+      release_tag: ${{ steps.integration.outputs.release_tag }}
       cache_week: ${{ steps.source.outputs.cache_week }}
 
     steps:
@@ -84,12 +96,16 @@ jobs:
         env:
           INPUT_OPENWRT_REPO: ${{ inputs.openwrt_repo }}
           INPUT_OPENWRT_REF: ${{ inputs.openwrt_ref }}
+          INPUT_INTEGRATION_REPO: ${{ inputs.integration_repo }}
+          INPUT_INTEGRATION_REF: ${{ inputs.integration_ref }}
           INPUT_TARGET_PROFILE: ${{ inputs.target_profile }}
           INPUT_PACKAGE_SHARDS: ${{ inputs.package_shards }}
           INPUT_EXTRA_CONFIG: ${{ inputs.extra_config }}
           INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
           PAYLOAD_OPENWRT_REPO: ${{ github.event.client_payload.openwrt_repo }}
           PAYLOAD_OPENWRT_REF: ${{ github.event.client_payload.openwrt_ref }}
+          PAYLOAD_INTEGRATION_REPO: ${{ github.event.client_payload.integration_repo }}
+          PAYLOAD_INTEGRATION_REF: ${{ github.event.client_payload.integration_ref }}
           PAYLOAD_TARGET_PROFILE: ${{ github.event.client_payload.target_profile }}
           PAYLOAD_PACKAGE_SHARDS: ${{ github.event.client_payload.package_shards }}
           PAYLOAD_EXTRA_CONFIG: ${{ github.event.client_payload.extra_config }}
@@ -97,14 +113,20 @@ jobs:
         run: |
           set -eu
           openwrt_repo="${INPUT_OPENWRT_REPO:-${PAYLOAD_OPENWRT_REPO:-https://github.com/immortalwrt/immortalwrt.git}}"
-          openwrt_ref="${INPUT_OPENWRT_REF:-${PAYLOAD_OPENWRT_REF:-openwrt-24.10}}"
-          target_profile="${INPUT_TARGET_PROFILE:-${PAYLOAD_TARGET_PROFILE:-gemtek_xr1710g-ubi}}"
+          openwrt_ref="${INPUT_OPENWRT_REF:-${PAYLOAD_OPENWRT_REF:-master}}"
+          integration_repo="${INPUT_INTEGRATION_REPO:-${PAYLOAD_INTEGRATION_REPO:-https://github.com/YYH2913/openwrt.git}}"
+          integration_ref="${INPUT_INTEGRATION_REF:-${PAYLOAD_INTEGRATION_REF:-xr1710g-6.18-integration}}"
+          target_profile="${INPUT_TARGET_PROFILE:-${PAYLOAD_TARGET_PROFILE:-econet_xr1710g-ubi}}"
           package_shards="${INPUT_PACKAGE_SHARDS:-${PAYLOAD_PACKAGE_SHARDS:-12}}"
           extra_config="${INPUT_EXTRA_CONFIG:-${PAYLOAD_EXTRA_CONFIG:-}}"
           create_release="${INPUT_CREATE_RELEASE:-${PAYLOAD_CREATE_RELEASE:-true}}"
 
+          case "${integration_ref}" in
+            none|skip) integration_ref="" ;;
+          esac
+
           case "${target_profile}" in
-            gemtek_xr1710g) target_profile="gemtek_xr1710g-ubi" ;;
+            gemtek_xr1710g|gemtek_xr1710g-ubi|econet_xr1710g) target_profile="econet_xr1710g-ubi" ;;
           esac
 
           case "${package_shards}" in
@@ -123,6 +145,8 @@ jobs:
           {
             printf 'openwrt_repo=%s\n' "${openwrt_repo}"
             printf 'openwrt_ref=%s\n' "${openwrt_ref}"
+            printf 'integration_repo=%s\n' "${integration_repo}"
+            printf 'integration_ref=%s\n' "${integration_ref}"
             printf 'target_profile=%s\n' "${target_profile}"
             printf 'package_shards=%s\n' "${package_shards}"
             printf 'package_matrix=%s\n' "${package_matrix}"
@@ -148,21 +172,46 @@ jobs:
           if [ -z "${safe_ref}" ]; then
             safe_ref="${source_short}"
           fi
-          release_tag="xr1710g-packages-${safe_ref}-${source_short}"
 
           {
             printf 'source_commit=%s\n' "${source_commit}"
             printf 'source_short=%s\n' "${source_short}"
             printf 'safe_ref=%s\n' "${safe_ref}"
-            printf 'release_tag=%s\n' "${release_tag}"
             printf 'cache_week=%s\n' "${cache_week}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve integration commit
+        id: integration
+        env:
+          INTEGRATION_REPO: ${{ steps.resolve.outputs.integration_repo }}
+          INTEGRATION_REF: ${{ steps.resolve.outputs.integration_ref }}
+          SAFE_REF: ${{ steps.source.outputs.safe_ref }}
+          SOURCE_SHORT: ${{ steps.source.outputs.source_short }}
+        run: |
+          set -eux
+          integration_commit=""
+          integration_short=""
+          if [ -n "${INTEGRATION_REF}" ]; then
+            mkdir -p integration-probe
+            git -C integration-probe init
+            git -C integration-probe remote add origin "${INTEGRATION_REPO}"
+            git -C integration-probe fetch --depth 1 origin "${INTEGRATION_REF}"
+            integration_commit="$(git -C integration-probe rev-parse FETCH_HEAD)"
+            integration_short="$(printf '%s' "${integration_commit}" | cut -c1-12)"
+          fi
+          release_tag="xr1710g-packages-${SAFE_REF}-${SOURCE_SHORT}${integration_short:+-${integration_short}}"
+
+          {
+            printf 'integration_commit=%s\n' "${integration_commit}"
+            printf 'integration_short=%s\n' "${integration_short}"
+            printf 'release_tag=%s\n' "${release_tag}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to build
         id: decision
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          RELEASE_TAG: ${{ steps.integration.outputs.release_tag }}
         run: |
           set -eu
           should_build=true
@@ -205,6 +254,9 @@ jobs:
       OPENWRT_REF: ${{ needs.check-upstream.outputs.openwrt_ref }}
       OPENWRT_SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
       OPENWRT_SOURCE_SHORT: ${{ needs.check-upstream.outputs.source_short }}
+      INTEGRATION_REPO: ${{ needs.check-upstream.outputs.integration_repo }}
+      INTEGRATION_REF: ${{ needs.check-upstream.outputs.integration_ref }}
+      INTEGRATION_COMMIT: ${{ needs.check-upstream.outputs.integration_commit }}
       SAFE_REF: ${{ needs.check-upstream.outputs.safe_ref }}
       CACHE_WEEK: ${{ needs.check-upstream.outputs.cache_week }}
       TARGET_PROFILE: ${{ needs.check-upstream.outputs.target_profile }}
@@ -240,328 +292,17 @@ jobs:
             file wget curl ccache libelf-dev device-tree-compiler \
             python3-ply python3-pyelftools qemu-utils zstd
 
-      - name: Clone OpenWrt source on Linux
-        run: |
-          set -eux
-          mkdir -p "${SOURCE_DIR}"
-          git -C "${SOURCE_DIR}" init
-          git -C "${SOURCE_DIR}" remote add origin "${OPENWRT_REPO}"
-          git -C "${SOURCE_DIR}" fetch --depth 1 origin "${OPENWRT_SOURCE_COMMIT}" || \
-            git -C "${SOURCE_DIR}" fetch --depth 1 origin "${OPENWRT_REF}"
-          git -C "${SOURCE_DIR}" checkout --force "${OPENWRT_SOURCE_COMMIT}"
-          git -C "${SOURCE_DIR}" log -1 --oneline
-
-      - name: Add XR1710G device support
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          profile_exists=false
-          if grep -q '^define Device/gemtek_xr1710g-ubi$' target/linux/airoha/image/an7581.mk; then
-            profile_exists=true
-            if [ -f target/linux/airoha/dts/an7581-npu-mt7996.dtsi ]; then
-              echo "XR1710G device profile and NPU MT7996 DTS already exist in source; applying support deltas only."
-            else
-              echo "XR1710G device profile exists; importing missing NPU MT7996 DTS."
-            fi
-          fi
-
-          support_dir="${RUNNER_TEMP}/xr1710g-support"
-          rm -rf "${support_dir}"
-          git clone --depth 1 --filter=blob:none --sparse --branch xr1710g \
-            https://github.com/hurrian/openwrt-w1700k.git "${support_dir}"
-          git -C "${support_dir}" sparse-checkout set --no-cone \
-            target/linux/airoha/image/an7581.mk \
-            target/linux/airoha/dts/an7581-xr1710g-ubi.dts \
-            target/linux/airoha/dts/an7581-gemtek-17xx-common.dtsi \
-            target/linux/airoha/dts/an7581-npu-mt7996.dtsi \
-            target/linux/airoha/an7581/base-files \
-            package/boot/uboot-tools/uboot-envtools/files/airoha_an7581
-
-          install -m 0644 "${support_dir}/target/linux/airoha/dts/an7581-npu-mt7996.dtsi" target/linux/airoha/dts/
-          modules_file="target/linux/airoha/modules.mk"
-          if grep -q 'KernelPackage/pwm-an7581' "${modules_file}"; then
-            sed -i \
-              -e 's#KernelPackage/pwm-an7581#KernelPackage/pwm-airoha#g' \
-              -e 's#KernelPackage,pwm-an7581#KernelPackage,pwm-airoha#g' \
-              -e 's#TITLE:=Airoha EN7581 PWM#TITLE:=Airoha AN7581 and AN7583 PWM#' \
-              -e 's#DEPENDS:=@(TARGET_airoha_an7581)#DEPENDS:=@TARGET_airoha_an7581||TARGET_airoha_an7583#' \
-              "${modules_file}"
-          fi
-          grep -q '^define KernelPackage/pwm-airoha$' "${modules_file}"
-          grep -Fq '$(eval $(call KernelPackage,pwm-airoha))' "${modules_file}"
-          ! grep -q 'pwm-an7581' "${modules_file}"
-          for uboot_env_dir in package/boot/uboot-envtools/files package/boot/uboot-tools/uboot-envtools/files; do
-            if [ -d "${uboot_env_dir}" ]; then
-              install -m 0644 "${support_dir}/package/boot/uboot-tools/uboot-envtools/files/airoha_an7581" "${uboot_env_dir}/airoha_an7581"
-              grep -q 'gemtek,xr1710g-ubi' "${uboot_env_dir}/airoha_an7581"
-            fi
-          done
-          if [ "${profile_exists}" = "true" ]; then
-            test -f target/linux/airoha/dts/an7581-npu-mt7996.dtsi
-            exit 0
-          fi
-          install -m 0644 "${support_dir}/target/linux/airoha/dts/an7581-xr1710g-ubi.dts" target/linux/airoha/dts/
-          install -m 0644 "${support_dir}/target/linux/airoha/dts/an7581-gemtek-17xx-common.dtsi" target/linux/airoha/dts/
-          mkdir -p target/linux/airoha/an7581/base-files
-          cp -a "${support_dir}/target/linux/airoha/an7581/base-files/." target/linux/airoha/an7581/base-files/
-          if ! grep -q '^define Build/an7581-chainloader$' target/linux/airoha/image/an7581.mk; then
-            {
-              printf '\n'
-              awk '$0 == "define Build/an7581-chainloader" { show = 1 } show { print } $0 == "endef" && show { exit }' \
-                "${support_dir}/target/linux/airoha/image/an7581.mk"
-            } >> target/linux/airoha/image/an7581.mk
-          fi
-          if ! grep -q '^define Device/gemtek_17xx-common$' target/linux/airoha/image/an7581.mk; then
-            {
-              printf '\n'
-              awk '$0 == "define Device/gemtek_17xx-common" { show = 1 } show { print } $0 == "endef" && show { exit }' \
-                "${support_dir}/target/linux/airoha/image/an7581.mk"
-            } >> target/linux/airoha/image/an7581.mk
-          fi
-          {
-            printf '\n'
-            awk '$0 == "define Device/gemtek_xr1710g-ubi" { show = 1 } show { print } $0 == "TARGET_DEVICES += gemtek_xr1710g-ubi" && show { exit }' \
-              "${support_dir}/target/linux/airoha/image/an7581.mk"
-          } >> target/linux/airoha/image/an7581.mk
-
-          grep -q '^define Device/gemtek_xr1710g-ubi$' target/linux/airoha/image/an7581.mk
-          grep -q '^define Device/gemtek_17xx-common$' target/linux/airoha/image/an7581.mk
-          grep -q '^define Build/an7581-chainloader$' target/linux/airoha/image/an7581.mk
-          test -f target/linux/airoha/dts/an7581-npu-mt7996.dtsi
-
-      - name: Apply XR1710G reference device package overrides
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          image_file="target/linux/airoha/image/an7581.mk"
-          grep -q '^define Device/gemtek_xr1710g-ubi$' "${image_file}"
-          if awk '$0 == "define Device/gemtek_xr1710g-ubi" { show = 1 } show { print } $0 == "endef" && show { exit }' "${image_file}" | grep -Fq '$(Device/gemtek_17xx-common)'; then
-            if ! awk '$0 == "define Device/gemtek_xr1710g-ubi" { show = 1 } show { print } $0 == "endef" && show { exit }' "${image_file}" | grep -q 'uboot-envtools'; then
-              awk '
-                /^define Device\/gemtek_xr1710g-ubi$/ { in_device = 1 }
-                in_device && /^endef$/ {
-                  print "  DEVICE_PACKAGES += uboot-envtools"
-                  in_device = 0
-                }
-                { print }
-              ' "${image_file}" > "${image_file}.tmp"
-              mv "${image_file}.tmp" "${image_file}"
-            fi
-            awk '$0 == "define Device/gemtek_xr1710g-ubi" { show = 1 } show { print } $0 == "endef" && show { exit }' "${image_file}"
-            awk '$0 == "define Device/gemtek_xr1710g-ubi" { show = 1 } show { print } $0 == "endef" && show { exit }' "${image_file}" | grep -q 'uboot-envtools'
-            echo "Using upstream Gemtek XR1710G package set."
-            exit 0
-          fi
-          tmp_file="$(mktemp)"
-          awk '
-            function print_xr1710g_packages() {
-              print "  DEVICE_PACKAGES := -airoha-en7581-npu-firmware \\"
-              print "                    -kmod-input-gpio-keys-polled -kmod-leds-pwm \\"
-              print "                    -kmod-pwm-airoha \\"
-              print "                    airoha-en7581-mt7996-npu-firmware \\"
-              print "                    fitblk kmod-i2c-an7581 kmod-hwmon-nct7802 \\"
-              print "                    kmod-mt7996-firmware kmod-phy-realtek \\"
-              print "                    rtl8261n-firmware \\"
-              print "                    uboot-envtools \\"
-              print "                    wpad-openssl"
-            }
-            /^define Device\/gemtek_xr1710g-ubi$/ {
-              in_device = 1
-              saw_packages = 0
-              print
-              next
-            }
-            in_device && /^endef$/ {
-              if (!saw_packages) {
-                print_xr1710g_packages()
-              }
-              in_device = 0
-              skip_continuation = 0
-              print
-              next
-            }
-            in_device && skip_continuation {
-              if ($0 !~ /\\$/) {
-                skip_continuation = 0
-              }
-              next
-            }
-            in_device && /^[[:space:]]*DEVICE_PACKAGES[[:space:]]*:=/ {
-              print_xr1710g_packages()
-              saw_packages = 1
-              if ($0 ~ /\\$/) {
-                skip_continuation = 1
-              }
-              next
-            }
-            { print }
-          ' "${image_file}" > "${tmp_file}"
-          mv "${tmp_file}" "${image_file}"
-          sed -n '/^define Device\/gemtek_xr1710g-ubi$/,/^endef$/p' "${image_file}"
-          grep -q -- '-kmod-pwm-airoha' "${image_file}"
-          grep -q 'airoha-en7581-mt7996-npu-firmware' "${image_file}"
-
-      - name: Drop XR1710G chainloader artifact from system firmware profile
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          image_file="target/linux/airoha/image/an7581.mk"
-          sed -i '/^[[:space:]]*ARTIFACT\/chainload-uboot\.itb := an7581-chainloader gemtek_xr1710g$/d' "${image_file}"
-          sed -n '/^define Device\/gemtek_xr1710g-ubi$/,/^endef$/p' "${image_file}"
-          if sed -n '/^define Device\/gemtek_xr1710g-ubi$/,/^endef$/p' "${image_file}" | grep -q 'ARTIFACT/chainload-uboot.itb'; then
-            echo "XR1710G system firmware profile still contains a chainloader artifact."
-            exit 1
-          fi
-
-      - name: Drop XR1710G AFE DTS override when base DTS lacks AFE
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          dts_file="target/linux/airoha/dts/an7581-xr1710g-ubi.dts"
-          test -f "${dts_file}"
-          if grep -Rqs '^[[:space:]]*afe:' target/linux/airoha/dts; then
-            echo "Base DTS defines afe label; keeping XR1710G AFE override."
-            exit 0
-          fi
-
-          if grep -q '^&afe[[:space:]]*{' "${dts_file}"; then
-            awk '
-              /^&afe[[:space:]]*\{/ {
-                skip = 1
-                depth = 1
-                next
-              }
-              skip {
-                depth += gsub(/\{/, "{")
-                depth -= gsub(/\}/, "}")
-                if (depth <= 0 && $0 ~ /};/) {
-                  skip = 0
-                }
-                next
-              }
-              { print }
-            ' "${dts_file}" > "${dts_file}.tmp"
-            mv "${dts_file}.tmp" "${dts_file}"
-          fi
-          ! grep -q '^&afe[[:space:]]*{' "${dts_file}"
-
-      - name: Add Airoha offload sk_buff kernel patch
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          patch_file="target/linux/airoha/patches-6.6/999-fix-airoha-offload-skbuff-include.patch"
-          mkdir -p "$(dirname "${patch_file}")"
-          cat > "${patch_file}" <<'EOF'
-          --- a/include/linux/soc/airoha/airoha_offload.h
-          +++ b/include/linux/soc/airoha/airoha_offload.h
-          @@ -9,2 +9,3 @@
-           #include <linux/spinlock.h>
-          +#include <linux/skbuff.h>
-           #include <linux/workqueue.h>
-          EOF
-          grep -n -A8 -B2 'skbuff.h' "${patch_file}"
-
-      - name: Add Airoha PWM Linux 6.6 compatibility patch
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          patch_file="target/linux/airoha/patches-6.6/999-fix-airoha-pwm-linux66-api.patch"
-          mkdir -p "$(dirname "${patch_file}")"
-          cat > "${patch_file}" <<'EOF'
-          --- a/drivers/pwm/pwm-airoha.c
-          +++ b/drivers/pwm/pwm-airoha.c
-          @@ -26,6 +26,7 @@
-           #include <linux/platform_device.h>
-           #include <linux/pwm.h>
-           #include <linux/regmap.h>
-          +#include <linux/slab.h>
-           #include <linux/types.h>
-           
-           #define AIROHA_PWM_REG_SGPIO_LED_DATA		0x0024
-          @@ -88,6 +89,7 @@
-           };
-           
-           struct airoha_pwm {
-          +	struct pwm_chip chip;
-           	struct regmap *regmap;
-           
-           	DECLARE_BITMAP(initialized, AIROHA_PWM_MAX_CHANNELS);
-          @@ -97,6 +99,11 @@
-           	/* Cache bucket used by each pwm channel */
-           	u8 channel_bucket[AIROHA_PWM_MAX_CHANNELS];
-           };
-          +
-          +static inline struct airoha_pwm *to_airoha_pwm(struct pwm_chip *chip)
-          +{
-          +	return container_of(chip, struct airoha_pwm, chip);
-          +}
-           
-           /* The PWM hardware supports periods between 4 ms and 1 s */
-           #define AIROHA_PWM_PERIOD_TICK_NS	(4 * NSEC_PER_MSEC)
-          @@ -155,7 +162,7 @@
-           	 * and period_ns is clamped to AIROHA_PWM_PERIOD_MAX_NS and fit in a
-           	 * u64.
-           	 */
-          -	return DIV_U64_ROUND_UP(duty_tick * period_ns, AIROHA_PWM_DUTY_FULL);
-          +	return DIV64_U64_ROUND_UP(duty_tick * period_ns, AIROHA_PWM_DUTY_FULL);
-           }
-           
-           static int airoha_pwm_get_bucket(struct airoha_pwm *pc, int bucket,
-          @@ -505,7 +512,7 @@
-           static int airoha_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
-           			    const struct pwm_state *state)
-           {
-          -	struct airoha_pwm *pc = pwmchip_get_drvdata(chip);
-          +	struct airoha_pwm *pc = to_airoha_pwm(chip);
-           	u32 period_ticks, duty_ticks;
-           	u32 period_ns, duty_ns;
-           
-          @@ -546,7 +553,7 @@
-           static int airoha_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
-           				struct pwm_state *state)
-           {
-          -	struct airoha_pwm *pc = pwmchip_get_drvdata(chip);
-          +	struct airoha_pwm *pc = to_airoha_pwm(chip);
-           	int ret, hwpwm = pwm->hwpwm;
-           	u32 addr, shift, val;
-           	u8 bucket;
-          @@ -580,12 +587,15 @@
-           	struct pwm_chip *chip;
-           	int ret;
-           
-          -	chip = devm_pwmchip_alloc(dev, AIROHA_PWM_MAX_CHANNELS, sizeof(*pc));
-          -	if (IS_ERR(chip))
-          -		return PTR_ERR(chip);
-          +	pc = devm_kzalloc(dev, sizeof(*pc), GFP_KERNEL);
-          +	if (!pc)
-          +		return -ENOMEM;
-           
-          +	chip = &pc->chip;
-          +	chip->dev = dev;
-           	chip->ops = &airoha_pwm_ops;
-          -	pc = pwmchip_get_drvdata(chip);
-          +	chip->npwm = AIROHA_PWM_MAX_CHANNELS;
-          +	chip->base = -1;
-           
-           	pc->regmap = device_node_to_regmap(dev_of_node(dev->parent));
-           	if (IS_ERR(pc->regmap))
-          EOF
-          grep -n -A8 -B2 'devm_kzalloc\|DIV64_U64_ROUND_UP' "${patch_file}"
-
-      - name: Seed Airoha kernel config defaults
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          kernel_config="$(
-            find "target/linux/${TARGET}/${SUBTARGET}" -maxdepth 1 -type f -name 'config-*' \
-              | sort -V \
-              | tail -n 1
-          )"
-          test -n "${kernel_config}"
-          if ! grep -Eq '^(CONFIG_SND_SOC_AN7581=|# CONFIG_SND_SOC_AN7581 is not set)' "${kernel_config}"; then
-            printf '\n# CONFIG_SND_SOC_AN7581 is not set\n' >> "${kernel_config}"
-          fi
-          grep -n 'SND_SOC_AN7581' "${kernel_config}"
+      - name: Prepare OpenWrt source with XR1710G integration
+        id: prepare
+        uses: ./.github/actions/prepare-xr1710g-source
+        with:
+          openwrt-repo: ${{ env.OPENWRT_REPO }}
+          openwrt-ref: ${{ env.OPENWRT_REF }}
+          openwrt-commit: ${{ env.OPENWRT_SOURCE_COMMIT }}
+          integration-repo: ${{ env.INTEGRATION_REPO }}
+          integration-ref: ${{ env.INTEGRATION_REF }}
+          integration-commit: ${{ env.INTEGRATION_COMMIT }}
+          source-dir: ${{ env.SOURCE_DIR }}
 
       - name: Restore downloads and ccache
         uses: actions/cache@v4
@@ -569,7 +310,7 @@ jobs:
           path: |
             ${{ env.SOURCE_DIR }}/dl
             ${{ env.CCACHE_DIR }}
-          key: xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-packages-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-${{ hashFiles('.github/workflows/build-packages-xr1710g.yml') }}
+          key: xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-packages-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-${{ hashFiles('.github/workflows/build-packages-xr1710g.yml', '.github/actions/prepare-xr1710g-source/action.yml') }}
           restore-keys: |
             xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-packages-${{ env.OPENWRT_SOURCE_SHORT }}-shard-${{ env.SHARD_INDEX }}-
             xr1710g-downloads-${{ env.DOWNLOAD_CACHE_VERSION }}-${{ runner.os }}-${{ env.SAFE_REF }}-
@@ -675,39 +416,13 @@ jobs:
             git clone --depth 1 https://github.com/vernesong/OpenClash.git package/OpenClash
           fi
 
-      - name: Add MLO LuCI package
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          if [ ! -d package/luci-app-mlo ]; then
-            git clone --depth 1 https://github.com/YYH2913/luci-app-mlo.git package/luci-app-mlo
-          fi
-
-      - name: Add Airoha NPU LuCI package
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          if [ ! -d package/luci-app-airoha-npu ]; then
-            git clone --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git package/luci-app-airoha-npu
-          fi
-          sed -i 's#^include \.\./\.\./luci\.mk#include $(TOPDIR)/feeds/luci/luci.mk#' package/luci-app-airoha-npu/Makefile
-
-      - name: Add W1700K fancontrol package
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -eux
-          if [ ! -d package/luci-app-w1700k-fancontrol ]; then
-            git clone --depth 1 https://github.com/rchen14b/luci-app-w1700k-fancontrol.git package/luci-app-w1700k-fancontrol
-          fi
-          sed -i 's#^include \.\./\.\./luci\.mk#include $(TOPDIR)/feeds/luci/luci.mk#' package/luci-app-w1700k-fancontrol/Makefile
-
       - name: Write package build config
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
           set -eux
           profile="${TARGET_PROFILE}"
           case "${profile}" in
-            gemtek_xr1710g) profile="gemtek_xr1710g-ubi" ;;
+            gemtek_xr1710g|gemtek_xr1710g-ubi|econet_xr1710g) profile="econet_xr1710g-ubi" ;;
           esac
 
           cat > .config <<EOF
@@ -936,6 +651,11 @@ jobs:
             echo "OpenWrt repo: ${OPENWRT_REPO}"
             echo "OpenWrt ref: ${OPENWRT_REF}"
             echo "OpenWrt commit: ${OPENWRT_SOURCE_COMMIT}"
+            if [ -n "${INTEGRATION_COMMIT}" ]; then
+              echo "Integration repo: ${INTEGRATION_REPO}"
+              echo "Integration ref: ${INTEGRATION_REF}"
+              echo "Integration commit: ${INTEGRATION_COMMIT}"
+            fi
             echo "Target: ${TARGET}/${SUBTARGET}"
             echo "Profile: ${TARGET_PROFILE}"
             echo "Build type: package shard ${SHARD_INDEX}/${PACKAGE_SHARDS}"
@@ -1063,12 +783,12 @@ jobs:
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" \
               --title "packages ${build_time}" \
-              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}. All selected package sources compiled successfully."
+              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }} + integration ${{ needs.check-upstream.outputs.integration_short }}. All selected package sources compiled successfully."
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
           else
             gh release create "${RELEASE_TAG}" "${assets[@]}" \
               --title "packages ${build_time}" \
-              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }}. All selected package sources compiled successfully."
+              --notes "XR1710G package shard build for ${{ needs.check-upstream.outputs.openwrt_ref }} ${{ needs.check-upstream.outputs.source_short }} + integration ${{ needs.check-upstream.outputs.integration_short }}. All selected package sources compiled successfully."
           fi
 
       - name: Clean package release staging files

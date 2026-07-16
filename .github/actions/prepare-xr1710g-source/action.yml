@@ -1,0 +1,210 @@
+name: Prepare XR1710G OpenWrt source
+description: >-
+  Clone the ImmortalWrt baseline, merge the YYH2913 XR1710G integration
+  branch with a deterministic conflict resolution, and verify XR1710G
+  device support in the merged tree.
+
+inputs:
+  openwrt-repo:
+    description: OpenWrt/ImmortalWrt source repository URL
+    required: true
+  openwrt-ref:
+    description: OpenWrt branch, tag, or commit
+    required: true
+  openwrt-commit:
+    description: Resolved OpenWrt commit to build (defaults to the tip of openwrt-ref)
+    required: false
+    default: ""
+  integration-repo:
+    description: XR1710G integration source repository URL
+    required: false
+    default: https://github.com/YYH2913/openwrt.git
+  integration-ref:
+    description: XR1710G integration branch, tag, or commit (empty skips the merge)
+    required: false
+    default: xr1710g-6.18-integration
+  integration-commit:
+    description: Resolved integration commit to merge (defaults to the tip of integration-ref)
+    required: false
+    default: ""
+  source-dir:
+    description: Directory for the OpenWrt source tree
+    required: false
+    default: openwrt
+
+outputs:
+  source_commit:
+    description: Baseline OpenWrt commit that was checked out
+    value: ${{ steps.clone.outputs.source_commit }}
+  integration_commit:
+    description: Integration commit that was merged (empty when the merge was skipped)
+    value: ${{ steps.merge.outputs.integration_commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Clone OpenWrt baseline
+      id: clone
+      shell: bash
+      env:
+        OPENWRT_REPO: ${{ inputs.openwrt-repo }}
+        OPENWRT_REF: ${{ inputs.openwrt-ref }}
+        OPENWRT_COMMIT: ${{ inputs.openwrt-commit }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+      run: |
+        set -eux
+        # The merge step needs enough history on both sides to reach their
+        # common ancestor, so fetch a time window instead of --depth 1.
+        shallow_since="$(date -u -d '90 days ago' +%Y-%m-%d)"
+        mkdir -p "${SOURCE_DIR}"
+        git -C "${SOURCE_DIR}" init
+        git -C "${SOURCE_DIR}" remote add origin "${OPENWRT_REPO}"
+        fetch_ok=false
+        for fetch_target in "${OPENWRT_COMMIT}" "${OPENWRT_REF}"; do
+          [ -n "${fetch_target}" ] || continue
+          if git -C "${SOURCE_DIR}" fetch --no-tags --shallow-since="${shallow_since}" origin "${fetch_target}" || \
+             git -C "${SOURCE_DIR}" fetch --no-tags origin "${fetch_target}"; then
+            fetch_ok=true
+            break
+          fi
+        done
+        [ "${fetch_ok}" = "true" ]
+        source_commit="${OPENWRT_COMMIT:-$(git -C "${SOURCE_DIR}" rev-parse FETCH_HEAD)}"
+        git -C "${SOURCE_DIR}" checkout --force "${source_commit}"
+        git -C "${SOURCE_DIR}" log -1 --oneline
+        printf 'source_commit=%s\n' "$(git -C "${SOURCE_DIR}" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Merge XR1710G integration branch
+      id: merge
+      shell: bash
+      working-directory: ${{ inputs.source-dir }}
+      env:
+        INTEGRATION_REPO: ${{ inputs.integration-repo }}
+        INTEGRATION_REF: ${{ inputs.integration-ref }}
+        INTEGRATION_COMMIT: ${{ inputs.integration-commit }}
+      run: |
+        set -eux
+        case "${INTEGRATION_REF}" in
+          none|skip) INTEGRATION_REF="" ;;
+        esac
+        if [ -z "${INTEGRATION_REF}" ] && [ -z "${INTEGRATION_COMMIT}" ]; then
+          echo "No integration ref was provided; building the plain baseline."
+          printf 'integration_commit=\n' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        shallow_since="$(date -u -d '90 days ago' +%Y-%m-%d)"
+        git remote add integration "${INTEGRATION_REPO}"
+        fetch_ok=false
+        for fetch_target in "${INTEGRATION_COMMIT}" "${INTEGRATION_REF}"; do
+          [ -n "${fetch_target}" ] || continue
+          if git fetch --no-tags --shallow-since="${shallow_since}" integration "${fetch_target}" || \
+             git fetch --no-tags integration "${fetch_target}"; then
+            fetch_ok=true
+            break
+          fi
+        done
+        [ "${fetch_ok}" = "true" ]
+        integration_commit="${INTEGRATION_COMMIT:-$(git rev-parse FETCH_HEAD)}"
+
+        if ! git merge-base HEAD "${integration_commit}" >/dev/null 2>&1; then
+          echo "No common ancestor inside the shallow window; deepening both histories."
+          git fetch --no-tags --unshallow origin "$(git rev-parse HEAD)" || \
+            git fetch --no-tags origin "$(git rev-parse HEAD)"
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow integration "${integration_commit}"
+          else
+            git fetch --no-tags integration "${integration_commit}"
+          fi
+          git merge-base HEAD "${integration_commit}"
+        fi
+
+        merge_user=(-c user.name=xr1710g-build -c user.email=xr1710g-build@users.noreply.github.com)
+        if ! git "${merge_user[@]}" merge --no-ff --no-edit "${integration_commit}"; then
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [ "${conflicts}" != "target/linux/airoha/image/an7581.mk" ]; then
+            echo "The integration merge produced unexpected conflicts:"
+            printf '%s\n' "${conflicts}"
+            echo "Update the conflict resolution in .github/actions/prepare-xr1710g-source."
+            exit 1
+          fi
+
+          image_file="target/linux/airoha/image/an7581.mk"
+          git show ":2:${image_file}" | sed -n 's/^TARGET_DEVICES += //p' | sort \
+            > "${RUNNER_TEMP}/an7581-devices-baseline.txt"
+
+          # Known conflict: both sides edit the W1700K DEVICE_PACKAGES line.
+          # Take the integration side (it adds ethtool-full and
+          # kmod-phy-realtek), then restore ImmortalWrt's wpad-openssl
+          # preference, which is the only baseline-side change to this file.
+          git checkout --theirs -- "${image_file}"
+          awk '
+            /^define Device\/gemtek_w1700k-ubi$/ { in_w1700k = 1 }
+            in_w1700k && /^endef$/ { in_w1700k = 0 }
+            in_w1700k { gsub(/wpad-basic-mbedtls/, "wpad-openssl") }
+            { print }
+          ' "${image_file}" > "${image_file}.tmp"
+          mv "${image_file}.tmp" "${image_file}"
+
+          sed -n 's/^TARGET_DEVICES += //p' "${image_file}" | sort \
+            > "${RUNNER_TEMP}/an7581-devices-resolved.txt"
+          missing_devices="$(comm -23 "${RUNNER_TEMP}/an7581-devices-baseline.txt" "${RUNNER_TEMP}/an7581-devices-resolved.txt")"
+          if [ -n "${missing_devices}" ]; then
+            echo "The conflict resolution dropped baseline device profiles:"
+            printf '%s\n' "${missing_devices}"
+            exit 1
+          fi
+
+          git add "${image_file}"
+          git "${merge_user[@]}" commit --no-edit
+        fi
+        git log -1 --oneline
+        printf 'integration_commit=%s\n' "${integration_commit}" >> "$GITHUB_OUTPUT"
+
+    - name: Verify XR1710G device support
+      shell: bash
+      working-directory: ${{ inputs.source-dir }}
+      env:
+        INTEGRATION_REF: ${{ inputs.integration-ref }}
+        INTEGRATION_COMMIT: ${{ inputs.integration-commit }}
+      run: |
+        set -eux
+        case "${INTEGRATION_REF}" in
+          none|skip) INTEGRATION_REF="" ;;
+        esac
+        if [ -z "${INTEGRATION_REF}" ] && [ -z "${INTEGRATION_COMMIT}" ]; then
+          echo "Integration merge was skipped; not verifying XR1710G device support."
+          exit 0
+        fi
+
+        image_file="target/linux/airoha/image/an7581.mk"
+        grep -q '^define Device/econet_xr1710g-ubi$' "${image_file}"
+        grep -q '^TARGET_DEVICES += econet_xr1710g-ubi$' "${image_file}"
+        if sed -n '/^define Device\/econet_xr1710g-ubi$/,/^endef$/p' "${image_file}" | grep -q 'chainload-uboot'; then
+          echo "The XR1710G system firmware profile gained a chainloader artifact."
+          echo "It needs a separately built U-Boot binary and must not be part of system firmware builds."
+          exit 1
+        fi
+
+        test -f target/linux/airoha/dts/an7581-xr1710g-ubi.dts
+        test -f target/linux/airoha/an7581/base-files/etc/uci-defaults/17-xr1710g-wifi-defaults
+        grep -q '^define KernelPackage/pwm-airoha$' target/linux/airoha/modules.mk
+        test -f package/boot/uboot-tools/uboot-envtools/files/airoha_an7581
+        grep -q 'econet,xr1710g-ubi' package/boot/uboot-tools/uboot-envtools/files/airoha_an7581
+
+        for app in luci-app-mlo luci-app-airoha-npu luci-app-w1700k-fancontrol; do
+          test -d "package/${app}"
+        done
+
+        # Keep the guard from the 24.10 era: an undecided SND_SOC_AN7581
+        # symbol must not stall or fail the kernel config step.
+        kernel_config="$(
+          find target/linux/airoha/an7581 -maxdepth 1 -type f -name 'config-*' \
+            | sort -V \
+            | tail -n 1
+        )"
+        test -n "${kernel_config}"
+        if ! grep -Eq '^(CONFIG_SND_SOC_AN7581=|# CONFIG_SND_SOC_AN7581 is not set)' "${kernel_config}"; then
+          printf '\n# CONFIG_SND_SOC_AN7581 is not set\n' >> "${kernel_config}"
+        fi
+        grep -n 'SND_SOC_AN7581' "${kernel_config}"
